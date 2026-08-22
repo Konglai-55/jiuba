@@ -148,6 +148,34 @@ const DEFAULT_NAV_CARDS: NavCardRecord[] = [
   },
 ]
 
+const S3_REQUEST_TIMEOUT_MS = 12_000
+const RECORD_CACHE_TTL_MS = 60_000
+const RECORD_CACHE_STALE_MS = 15 * 60_000
+const RECORD_READ_CONCURRENCY = 12
+const CACHEABLE_COLLECTIONS = new Set<Collection>([
+  'nav-cards',
+  'content-cards',
+  'regions',
+  'site-settings',
+  'page-passwords',
+])
+
+type RecordCacheEntry = {
+  generation: number
+  records: readonly unknown[]
+  freshUntil: number
+  staleUntil: number
+}
+
+type RecordLoad = {
+  generation: number
+  promise: Promise<unknown[]>
+}
+
+const recordCache = new Map<Collection, RecordCacheEntry>()
+const recordLoads = new Map<Collection, RecordLoad>()
+const recordCacheGenerations = new Map<Collection, number>()
+
 function objectKey(collection: Collection, id: string | number) {
   return `${APP_DATA_PREFIX}${collection}/${encodeURIComponent(String(id))}.json`
 }
@@ -158,6 +186,23 @@ function adminPasswordKey() {
 
 function initializationKey() {
   return `${APP_DATA_PREFIX}meta/initialized.json`
+}
+
+function cacheGeneration(collection: Collection) {
+  return recordCacheGenerations.get(collection) || 0
+}
+
+function collectionFromKey(key: string): Collection | null {
+  if (!key.startsWith(APP_DATA_PREFIX)) return null
+  const collection = key.slice(APP_DATA_PREFIX.length).split('/', 1)[0] as Collection
+  return CACHEABLE_COLLECTIONS.has(collection) ? collection : null
+}
+
+function invalidateRecordCache(key: string) {
+  const collection = collectionFromKey(key)
+  if (!collection) return
+  recordCacheGenerations.set(collection, cacheGeneration(collection) + 1)
+  recordCache.delete(collection)
 }
 
 function numericId() {
@@ -174,7 +219,8 @@ function statusCode(error: unknown) {
 async function readJson<T>(key: string): Promise<T | null> {
   try {
     const result = await getS3Client().send(
-      new GetObjectCommand({ Bucket: getS3Bucket(), Key: key })
+      new GetObjectCommand({ Bucket: getS3Bucket(), Key: key }),
+      { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
     )
     if (!result.Body) return null
     return JSON.parse(await result.Body.transformToString()) as T
@@ -195,8 +241,10 @@ async function writeJson(key: string, value: unknown, createOnly = false) {
       ContentType: 'application/json; charset=utf-8',
       CacheControl: 'no-store',
       ...(createOnly ? { IfNoneMatch: '*' } : {}),
-    })
+    }),
+    { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
   )
+  invalidateRecordCache(key)
 }
 
 function privateEncryptionKeys() {
@@ -264,7 +312,11 @@ async function writePrivateJson(key: string, value: unknown) {
 }
 
 async function deleteKey(key: string) {
-  await getS3Client().send(new DeleteObjectCommand({ Bucket: getS3Bucket(), Key: key }))
+  await getS3Client().send(
+    new DeleteObjectCommand({ Bucket: getS3Bucket(), Key: key }),
+    { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
+  )
+  invalidateRecordCache(key)
 }
 
 async function deleteKeys(keys: Array<string | null | undefined>, concurrency = 10) {
@@ -327,7 +379,8 @@ async function listKeys(prefix: string) {
         Bucket: getS3Bucket(),
         Prefix: prefix,
         ContinuationToken: continuationToken,
-      })
+      }),
+      { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
     )
     keys.push(...(result.Contents || []).flatMap((item) => (item.Key ? [item.Key] : [])))
     continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined
@@ -336,11 +389,84 @@ async function listKeys(prefix: string) {
   return keys
 }
 
-async function listRecords<T>(collection: Collection): Promise<T[]> {
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  transform: (value: T) => Promise<R>
+) {
+  const results = new Array<R>(values.length)
+  let cursor = 0
+  const workers = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (cursor < values.length) {
+        const index = cursor++
+        results[index] = await transform(values[index])
+      }
+    }
+  )
+  await Promise.all(workers)
+  return results
+}
+
+async function loadRecords<T>(collection: Collection): Promise<T[]> {
   const prefix = `${APP_DATA_PREFIX}${collection}/`
   const keys = (await listKeys(prefix)).filter((key) => key.endsWith('.json'))
-  const records = await Promise.all(keys.map((key) => readJson<T>(key)))
+  const records = await mapWithConcurrency(
+    keys,
+    RECORD_READ_CONCURRENCY,
+    (key) => readJson<T>(key)
+  )
   return records.filter((record) => record !== null) as T[]
+}
+
+function refreshRecordCache<T>(collection: Collection): Promise<T[]> {
+  const generation = cacheGeneration(collection)
+  const existing = recordLoads.get(collection)
+  if (existing?.generation === generation) {
+    return existing.promise as Promise<T[]>
+  }
+
+  const promise = loadRecords<T>(collection)
+    .then((records) => {
+      if (cacheGeneration(collection) === generation) {
+        const now = Date.now()
+        recordCache.set(collection, {
+          generation,
+          records,
+          freshUntil: now + RECORD_CACHE_TTL_MS,
+          staleUntil: now + RECORD_CACHE_STALE_MS,
+        })
+      }
+      return records
+    })
+    .finally(() => {
+      if (recordLoads.get(collection)?.promise === promise) {
+        recordLoads.delete(collection)
+      }
+    })
+  recordLoads.set(collection, { generation, promise })
+  return promise
+}
+
+async function listRecords<T>(collection: Collection): Promise<T[]> {
+  if (!CACHEABLE_COLLECTIONS.has(collection)) {
+    return loadRecords<T>(collection)
+  }
+
+  const now = Date.now()
+  const generation = cacheGeneration(collection)
+  const cached = recordCache.get(collection)
+  if (cached?.generation === generation && cached.freshUntil > now) {
+    return [...cached.records] as T[]
+  }
+  if (cached?.generation === generation && cached.staleUntil > now) {
+    void refreshRecordCache<T>(collection).catch((error) => {
+      console.error(`Failed to refresh cached ${collection} records:`, error)
+    })
+    return [...cached.records] as T[]
+  }
+  return [...(await refreshRecordCache<T>(collection))]
 }
 
 async function listPrivateRecords<T>(collection: Collection): Promise<T[]> {
@@ -717,7 +843,8 @@ export async function verifyAdminPasswordRecord(password: string) {
 
 export async function checkS3DataStore() {
   await getS3Client().send(
-    new ListObjectsV2Command({ Bucket: getS3Bucket(), Prefix: APP_DATA_PREFIX, MaxKeys: 1 })
+    new ListObjectsV2Command({ Bucket: getS3Bucket(), Prefix: APP_DATA_PREFIX, MaxKeys: 1 }),
+    { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
   )
 }
 
