@@ -596,7 +596,20 @@ export async function getContentCardRecords(navCardId?: number) {
   const records = await listRecords<ContentCardRecord>('content-cards')
   return records
     .filter((record) => navCardId === undefined || record.navCardId === navCardId)
-    .sort((a, b) => a.displayOrder - b.displayOrder)
+    .sort(compareContentCardOrder)
+}
+
+// Older objects were written with displayOrder=0. Keep those records readable
+// while making every explicit order deterministic (including equal legacy dates).
+function compareContentCardOrder(a: ContentCardRecord, b: ContentCardRecord) {
+  const aHasOrder = Number.isFinite(a.displayOrder) && a.displayOrder > 0
+  const bHasOrder = Number.isFinite(b.displayOrder) && b.displayOrder > 0
+  if (aHasOrder && bHasOrder && a.displayOrder !== b.displayOrder) {
+    return a.displayOrder - b.displayOrder
+  }
+  if (aHasOrder !== bHasOrder) return aHasOrder ? -1 : 1
+  const createdAt = (a.createdAt || '').localeCompare(b.createdAt || '')
+  return createdAt || a.id - b.id
 }
 
 export async function createContentCardRecord(data: {
@@ -608,6 +621,7 @@ export async function createContentCardRecord(data: {
   detail?: string
   address?: string
   region?: string
+  displayOrder?: number
 }) {
   const now = new Date().toISOString()
   return createRecord<ContentCardRecord>('content-cards', {
@@ -619,7 +633,7 @@ export async function createContentCardRecord(data: {
     detail: data.detail || null,
     address: data.address || null,
     region: data.region || null,
-    displayOrder: 0,
+    displayOrder: data.displayOrder ?? 0,
     createdAt: now,
     updatedAt: now,
   })

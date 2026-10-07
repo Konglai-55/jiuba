@@ -30,6 +30,7 @@ interface ContentCard {
   detail: string | null
   address: string | null
   region: string | null
+  displayOrder: number
 }
 
 interface UploadItem {
@@ -51,7 +52,7 @@ interface UploadedFile {
 async function runWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
-  worker: (item: T) => Promise<R>
+  worker: (item: T, index: number) => Promise<R>
 ) {
   const results: PromiseSettledResult<R>[] = new Array(items.length)
   let cursor = 0
@@ -59,7 +60,7 @@ async function runWithConcurrency<T, R>(
     while (cursor < items.length) {
       const index = cursor++
       try {
-        results[index] = { status: 'fulfilled', value: await worker(items[index]) }
+        results[index] = { status: 'fulfilled', value: await worker(items[index], index) }
       } catch (error) {
         results[index] = { status: 'rejected', reason: error }
       }
@@ -264,8 +265,12 @@ export default function ContentCardsManager() {
     setSaving(true)
     const region = resolveRegion()
     const successfulIds = new Set<string>()
+    // Reserve a contiguous range before concurrent uploads. The selected-file
+    // index, not completion timing, determines order across separate batches.
+    const nextDisplayOrder =
+      contentCards.reduce((max, card) => Math.max(max, card.displayOrder || 0), 0) + 1
 
-    const results = await runWithConcurrency(uploadItems, 3, async (item) => {
+    const results = await runWithConcurrency(uploadItems, 3, async (item, itemIndex) => {
       let uploaded: UploadedFile | null =
         item.url && item.pathname ? { url: item.url, pathname: item.pathname } : null
       try {
@@ -275,8 +280,13 @@ export default function ContentCardsManager() {
           title: item.file.name,
           imageUrl: uploaded.url,
           region,
+          displayOrder: nextDisplayOrder + itemIndex,
         })
-        setContentCards((prev) => [...prev, newCard])
+        setContentCards((prev) =>
+          [...prev, newCard].sort((a, b) =>
+            (a.displayOrder || Number.MAX_SAFE_INTEGER) - (b.displayOrder || Number.MAX_SAFE_INTEGER)
+          )
+        )
         successfulIds.add(item.id)
         return newCard
       } catch (error) {

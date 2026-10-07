@@ -16,6 +16,7 @@ export async function createContentCard(data: {
   detail?: string
   address?: string
   region?: string
+  displayOrder?: number
 }) {
   return createContentCardRecord(data)
 }
