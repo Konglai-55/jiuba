@@ -1,3 +1,5 @@
+import { unlink, readFile, writeFile, rename } from 'node:fs/promises'
+import { localMediaPath } from '@/lib/local-media'
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -149,9 +151,35 @@ const DEFAULT_NAV_CARDS: NavCardRecord[] = [
 ]
 
 const S3_REQUEST_TIMEOUT_MS = 12_000
-const RECORD_CACHE_TTL_MS = 60_000
-const RECORD_CACHE_STALE_MS = 15 * 60_000
+const S3_READ_TIMEOUT_MS = 5_000
+const RECORD_CACHE_TTL_MS = 10 * 60_000
+const RECORD_CACHE_STALE_MS = 7 * 24 * 60 * 60_000
 const RECORD_READ_CONCURRENCY = 12
+const PUBLIC_SNAPSHOT_COLLECTIONS = new Set<Collection>(['nav-cards', 'content-cards', 'regions', 'site-settings'])
+const PUBLIC_SNAPSHOT_DIR = '/srv/www/jiuba/.dreampanel/shared/data-cache'
+
+async function readPublicSnapshot<T>(collection: Collection): Promise<T[] | null> {
+  if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return null
+  try {
+    const records = JSON.parse(await readFile(PUBLIC_SNAPSHOT_DIR + '/' + collection + '.json', 'utf8'))
+    return Array.isArray(records) ? records as T[] : null
+  } catch {
+    return null
+  }
+}
+
+async function writePublicSnapshot<T>(collection: Collection, records: T[]): Promise<void> {
+  if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return
+  const target = PUBLIC_SNAPSHOT_DIR + '/' + collection + '.json'
+  const temporary = target + '.' + randomUUID() + '.tmp'
+  try {
+    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 })
+    await rename(temporary, target)
+  } catch (error) {
+    console.error('Failed to update public data snapshot:', collection, error)
+  }
+}
+
 const CACHEABLE_COLLECTIONS = new Set<Collection>([
   'nav-cards',
   'content-cards',
@@ -175,6 +203,50 @@ type RecordLoad = {
 const recordCache = new Map<Collection, RecordCacheEntry>()
 const recordLoads = new Map<Collection, RecordLoad>()
 const recordCacheGenerations = new Map<Collection, number>()
+
+const snapshotMutations = new Map<Collection, Promise<void>>()
+
+async function mutatePublicSnapshot<T>(collection: Collection, mutate: (records: T[]) => T[]) {
+  if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return
+  const previous = snapshotMutations.get(collection) || Promise.resolve()
+  const next = previous.then(async () => {
+    let records: T[] = []
+    try {
+      const value = JSON.parse(await readFile(PUBLIC_SNAPSHOT_DIR + '/' + collection + '.json', 'utf8'))
+      if (Array.isArray(value)) records = value as T[]
+    } catch {}
+    await writePublicSnapshot(collection, mutate(records))
+  })
+  snapshotMutations.set(collection, next.catch(() => undefined))
+  await next
+}
+
+function recordKeyParts(key: string) {
+  if (!key.startsWith(APP_DATA_PREFIX)) return null
+  const rest = key.slice(APP_DATA_PREFIX.length)
+  const match = /^(nav-cards|content-cards|regions|site-settings)\/([^/]+)\.json$/.exec(rest)
+  return match ? { collection: match[1] as Collection, id: decodeURIComponent(match[2]) } : null
+}
+
+async function updatePublicSnapshotRecord(key: string, value: unknown) {
+  const parts = recordKeyParts(key)
+  if (!parts) return
+  await mutatePublicSnapshot(parts.collection, (records) => {
+    const index = records.findIndex((record) => String((record as { id?: unknown }).id) === parts.id)
+    if (index < 0) return [...records, value]
+    const next = [...records]
+    next[index] = value
+    return next
+  })
+}
+
+async function removePublicSnapshotRecord(key: string) {
+  const parts = recordKeyParts(key)
+  if (!parts) return
+  await mutatePublicSnapshot(parts.collection, (records) =>
+    records.filter((record) => String((record as { id?: unknown }).id) !== parts.id)
+  )
+}
 
 function objectKey(collection: Collection, id: string | number) {
   return `${APP_DATA_PREFIX}${collection}/${encodeURIComponent(String(id))}.json`
@@ -220,7 +292,7 @@ async function readJson<T>(key: string): Promise<T | null> {
   try {
     const result = await getS3Client().send(
       new GetObjectCommand({ Bucket: getS3Bucket(), Key: key }),
-      { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
+      { abortSignal: AbortSignal.timeout(S3_READ_TIMEOUT_MS) }
     )
     if (!result.Body) return null
     return JSON.parse(await result.Body.transformToString()) as T
@@ -245,6 +317,7 @@ async function writeJson(key: string, value: unknown, createOnly = false) {
     { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
   )
   invalidateRecordCache(key)
+  await updatePublicSnapshotRecord(key, value)
 }
 
 function privateEncryptionKeys() {
@@ -311,27 +384,34 @@ async function writePrivateJson(key: string, value: unknown) {
   await writeJson(key, encryptRecord(value))
 }
 
-async function deleteKey(key: string) {
+async function deleteKey(key: string, timeoutMs = S3_REQUEST_TIMEOUT_MS) {
   await getS3Client().send(
     new DeleteObjectCommand({ Bucket: getS3Bucket(), Key: key }),
-    { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
+    { abortSignal: AbortSignal.timeout(timeoutMs) }
   )
   invalidateRecordCache(key)
+  await removePublicSnapshotRecord(key)
+}
+
+function isMediaKey(key: string) {
+  return !key.startsWith(APP_DATA_PREFIX)
+}
+
+function scheduleMediaDelete(key: string) {
+  void deleteKey(key, 4_000).catch((error) => {
+    console.error('Deferred media cleanup failed:', error instanceof Error ? error.name : 'unknown')
+  })
 }
 
 async function deleteKeys(keys: Array<string | null | undefined>, concurrency = 10) {
   const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key)))]
-  let cursor = 0
-  const workers = Array.from(
-    { length: Math.min(concurrency, uniqueKeys.length) },
-    async () => {
-      while (cursor < uniqueKeys.length) {
-        const key = uniqueKeys[cursor++]
-        await deleteKey(key)
-      }
-    }
-  )
-  await Promise.all(workers)
+  const dataKeys = uniqueKeys.filter((key) => !isMediaKey(key))
+  const mediaKeys = uniqueKeys.filter(isMediaKey)
+
+  // Metadata is the user-visible state. Delete it synchronously so the UI can
+  // finish promptly; object-storage media cleanup must not block that state change.
+  await Promise.all(dataKeys.map((key) => deleteKey(key)))
+  for (const key of mediaKeys) scheduleMediaDelete(key)
 }
 
 function storedMediaKey(url: string | null | undefined) {
@@ -366,7 +446,16 @@ export async function deleteUploadedMedia(pathname: string) {
   if (!pathname.startsWith('media/')) {
     throw new Error('Only media objects can be deleted through the upload API')
   }
-  await deleteKey(pathname)
+  const localPath = localMediaPath(pathname)
+  if (localPath) {
+    try {
+      await unlink(localPath)
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  scheduleMediaDelete(pathname)
 }
 
 async function listKeys(prefix: string) {
@@ -380,7 +469,7 @@ async function listKeys(prefix: string) {
         Prefix: prefix,
         ContinuationToken: continuationToken,
       }),
-      { abortSignal: AbortSignal.timeout(S3_REQUEST_TIMEOUT_MS) }
+      { abortSignal: AbortSignal.timeout(S3_READ_TIMEOUT_MS) }
     )
     keys.push(...(result.Contents || []).flatMap((item) => (item.Key ? [item.Key] : [])))
     continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined
@@ -428,8 +517,9 @@ function refreshRecordCache<T>(collection: Collection): Promise<T[]> {
   }
 
   const promise = loadRecords<T>(collection)
-    .then((records) => {
+    .then(async (records) => {
       if (cacheGeneration(collection) === generation) {
+        await writePublicSnapshot(collection, records)
         const now = Date.now()
         recordCache.set(collection, {
           generation,
@@ -439,6 +529,19 @@ function refreshRecordCache<T>(collection: Collection): Promise<T[]> {
         })
       }
       return records
+    })
+    .catch(async (error) => {
+      const snapshot = await readPublicSnapshot<T>(collection)
+      if (!snapshot) throw error
+      const now = Date.now()
+      recordCache.set(collection, {
+        generation,
+        records: snapshot,
+        freshUntil: now + RECORD_CACHE_TTL_MS,
+        staleUntil: now + RECORD_CACHE_STALE_MS,
+      })
+      console.warn('Serving last known public data after object storage timeout:', collection)
+      return snapshot
     })
     .finally(() => {
       if (recordLoads.get(collection)?.promise === promise) {
@@ -502,13 +605,27 @@ async function updateRecord<T extends { id: number }>(
   return updated
 }
 
+let navCardsSeedChecked = false
+
 async function seedNavCardsIfEmpty() {
   const existing = await listRecords<NavCardRecord>('nav-cards')
-  const initialized = await readJson<{ initializedAt: string }>(initializationKey())
-  if (initialized) return existing
+  if (navCardsSeedChecked) return existing
+  let initialized: { initializedAt: string } | null
+  try {
+    initialized = await readJson<{ initializedAt: string }>(initializationKey())
+  } catch (error) {
+    if (existing.length === 0) throw error
+    navCardsSeedChecked = true
+    return existing
+  }
+  if (initialized) {
+    navCardsSeedChecked = true
+    return existing
+  }
 
   if (existing.length > 0) {
     await writeJson(initializationKey(), { initializedAt: new Date().toISOString() })
+    navCardsSeedChecked = true
     return existing
   }
 
@@ -522,11 +639,12 @@ async function seedNavCardsIfEmpty() {
     })
   )
   await writeJson(initializationKey(), { initializedAt: new Date().toISOString() })
+  navCardsSeedChecked = true
   return listRecords<NavCardRecord>('nav-cards')
 }
 
 export async function getNavCardRecords() {
-  const [records] = await Promise.all([seedNavCardsIfEmpty(), ensureAdminPasswordRecord()])
+  const records = await seedNavCardsIfEmpty()
   return records.sort((a, b) => a.displayOrder - b.displayOrder)
 }
 
@@ -607,10 +725,11 @@ function compareContentCardOrder(a: ContentCardRecord, b: ContentCardRecord) {
   if (aHasOrder && bHasOrder && a.displayOrder !== b.displayOrder) {
     return a.displayOrder - b.displayOrder
   }
-  if (aHasOrder !== bHasOrder) return aHasOrder ? -1 : 1
+  if (aHasOrder !== bHasOrder) return aHasOrder ? 1 : -1
   const createdAt = (a.createdAt || '').localeCompare(b.createdAt || '')
   return createdAt || a.id - b.id
 }
+
 
 export async function createContentCardRecord(data: {
   navCardId: number
@@ -667,20 +786,21 @@ export async function updateContentCardRecord(
 }
 
 export async function deleteContentCardRecord(id: number) {
-  const [card, downloads] = await Promise.all([
-    readJson<ContentCardRecord>(objectKey('content-cards', id)),
-    listRecords<DownloadRecord>('download-records'),
-  ])
+  const card = await readJson<ContentCardRecord>(objectKey('content-cards', id))
   if (!card) return
 
-  await deleteKeys([
+  // Remove the visible record first. Download history and media cleanup are
+  // deferred so a slow object-store listing cannot make the delete appear stuck.
+  await deleteKey(objectKey('content-cards', id))
+  // Media cleanup is independent of the metadata delete. Do not scan download
+  // history here: that collection can be large and a slow listing must never
+  // block or delay the user-visible delete.
+  void deleteKeys([
     storedMediaKey(card.imageUrl),
     storedMediaKey(card.videoUrl),
-    objectKey('content-cards', id),
-    ...downloads
-      .filter((record) => record.contentCardId === id)
-      .map((record) => objectKey('download-records', record.id)),
-  ])
+  ]).catch((error) => {
+    console.error('Deferred content-card media cleanup failed:', error instanceof Error ? error.name : 'unknown')
+  })
 
   // Click events are intentionally retained for historical daily totals.
 }

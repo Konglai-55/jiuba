@@ -1,5 +1,6 @@
 'use client'
 
+import { logoutAdmin } from '@/app/actions/admin-password'
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
@@ -34,7 +35,8 @@ export default function ContentCardsPage() {
     return null
   }
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await logoutAdmin()
     localStorage.removeItem('admin_logged_in')
     router.push('/admin/login')
   }

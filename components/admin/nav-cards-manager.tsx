@@ -9,6 +9,7 @@ import { Plus, Trash2, Edit2 } from 'lucide-react'
 import { createNavCard, updateNavCard, deleteNavCard, getNavCards } from '@/app/actions/nav-cards'
 import { toast } from 'sonner'
 import { optimizeImageForUpload } from '@/lib/optimize-image'
+import { uploadMediaDirect } from '@/lib/direct-upload'
 
 interface NavCard {
   id: number
@@ -63,17 +64,9 @@ export default function NavCardsManager({ initialCards }: NavCardsManagerProps) 
     setUploading(true)
     try {
       const optimizedFile = await optimizeImageForUpload(file)
-      const formDataObj = new FormData()
-      formDataObj.append('file', optimizedFile)
-      const res = await fetch('/api/upload', { method: 'POST', body: formDataObj })
-      const json = await res.json().catch(() => null)
-      if (res.ok && json?.url) {
-        const { url } = json
-        setFormData((prev) => ({ ...prev, imageUrl: url }))
-        toast.success('图片上传成功')
-      } else {
-        throw new Error(json?.error || `图片上传失败（HTTP ${res.status}）`)
-      }
+      const uploaded = await uploadMediaDirect(optimizedFile)
+      setFormData((prev) => ({ ...prev, imageUrl: uploaded.url }))
+      toast.success('图片上传成功')
     } catch (error) {
       console.error('Upload error:', error)
       toast.error(error instanceof Error ? error.message : '上传失败')

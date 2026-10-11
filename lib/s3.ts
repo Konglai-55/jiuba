@@ -22,6 +22,7 @@ export function getS3Client() {
         secretAccessKey: requireEnv('S3_SECRET_KEY'),
       },
       forcePathStyle: true,
+      maxAttempts: 1,
     })
   }
 

@@ -33,6 +33,10 @@ function storage(initial = []) {
   let idIndex = 0
   const ids = [601, 101, 501, 201, 401, 301, 701, 801, 901]
   const mocks = {
+    'node:fs/promises': {
+      readFile: async () => { throw { code: 'ENOENT' } },
+      writeFile: async () => {}, rename: async () => {}, unlink: async () => {},
+    },
     '@aws-sdk/client-s3': commands,
     'node:crypto': { ...crypto, randomBytes: (size) => {
       if (size !== 6) return crypto.randomBytes(size)
@@ -77,7 +81,7 @@ test('legacy records: Tianhe three then Haizhu three, regardless of S3 key order
   assert.equal(names(result), labels.join(','))
 })
 
-test('same region stays together after a later upload and across navigation cards', async () => {
+test('upload sequence is retained without regrouping addresses, across navigation cards', async () => {
   const fixture = [card(1, '天河1', 0), card(2, '海珠1', 1), card(3, '天河2', 2), card(4, '海珠2', 3), card(5, '天河-other', 0, 2)]
   const { data } = storage(fixture)
   // Legacy zero-order records retain their timestamp order; new uploads use
@@ -105,6 +109,17 @@ test('legacy missing dates and equal timestamps have a deterministic id tie-brea
   delete a.createdAt; delete b.createdAt; delete c.createdAt
   const { data } = storage([a, b, c])
   assert.equal(names(await data.getContentCardRecords(1)), '天河1,天河2,天河3')
+})
+
+test('new batches append after legacy uploads and keep selected order despite completion order', async () => {
+  const { data } = storage([card(9000, '旧图1', 0), card(8000, '旧图2', 1)])
+  for (const index of [2, 0, 1]) await data.createContentCardRecord({
+    navCardId: 1, title: `新图${index + 1}`, displayOrder: index + 1,
+  })
+  for (const index of [1, 0]) await data.createContentCardRecord({
+    navCardId: 1, title: `第二批${index + 1}`, displayOrder: index + 4,
+  })
+  assert.equal(names(await data.getContentCardRecords(1)), '旧图1,旧图2,新图1,新图2,新图3,第二批1,第二批2')
 })
 
 ;(async () => {

@@ -5,7 +5,9 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Plus, Trash2, Loader2, ImagePlus, X, CheckSquare, Square, MapPin, ChevronDown } from 'lucide-react'
 import { createContentCard, deleteContentCard, getContentCardsByNavCard } from '@/app/actions/content-cards'
+import { verifyAdminPassword } from '@/app/actions/admin-password'
 import { optimizeImageForUpload } from '@/lib/optimize-image'
+import { uploadMediaDirect } from '@/lib/direct-upload'
 import { getNavCards } from '@/app/actions/nav-cards'
 import { toast } from 'sonner'
 interface Region {
@@ -88,6 +90,10 @@ export default function ContentCardsManager() {
   const [customLabel, setCustomLabel] = useState<string>('')
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
   const [saving, setSaving] = useState(false)
+  const [reauthRequired, setReauthRequired] = useState(false)
+  const [reauthPassword, setReauthPassword] = useState('')
+  const [reauthError, setReauthError] = useState('')
+  const [reauthLoading, setReauthLoading] = useState(false)
 
   // 批量选择状态
   const [selectMode, setSelectMode] = useState(false)
@@ -171,74 +177,22 @@ export default function ContentCardsManager() {
   const uploadFile = async (item: UploadItem): Promise<UploadedFile> => {
     const file = await optimizeImageForUpload(item.file)
 
-    return new Promise((resolve, reject) => {
-      const data = new FormData()
-      data.append('file', file)
-      const xhr = new XMLHttpRequest()
-
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const progress = Math.round((e.loaded / e.total) * 100)
-          setUploadItems((prev) =>
-            prev.map((i) => (i.id === item.id ? { ...i, progress, status: 'uploading' } : i))
-          )
-        }
-      }
-
-      xhr.onload = () => {
-        try {
-          const json = JSON.parse(xhr.responseText)
-          if (xhr.status >= 200 && xhr.status < 300 && json.url && json.pathname) {
-            setUploadItems((prev) =>
-              prev.map((i) =>
-                i.id === item.id
-                  ? {
-                      ...i,
-                      progress: 100,
-                      status: 'done',
-                      url: json.url,
-                      pathname: json.pathname,
-                      error: undefined,
-                    }
-                  : i
-              )
-            )
-            resolve({ url: json.url, pathname: json.pathname })
-          } else {
-            const errMsg = json?.error || '上传失败'
-            setUploadItems((prev) =>
-              prev.map((i) => (i.id === item.id ? { ...i, status: 'error', error: errMsg } : i))
-            )
-            reject(new Error(errMsg))
-          }
-        } catch {
-          setUploadItems((prev) =>
-            prev.map((i) => (i.id === item.id ? { ...i, status: 'error', error: '响应解析失败' } : i))
-          )
-          reject(new Error('响应解析失败'))
-        }
-      }
-
-      xhr.onerror = () => {
-        setUploadItems((prev) =>
-          prev.map((i) => (i.id === item.id ? { ...i, status: 'error', error: '网络错误' } : i))
-        )
-        reject(new Error('网络错误'))
-      }
-
-      xhr.ontimeout = () => {
-        setUploadItems((prev) =>
-          prev.map((i) =>
-            i.id === item.id ? { ...i, status: 'error', error: '上传超时，请重试' } : i
-          )
-        )
-        reject(new Error('上传超时，请重试'))
-      }
-
-      xhr.timeout = 120_000
-      xhr.open('POST', '/api/upload')
-      xhr.send(data)
-    })
+    try {
+      const uploaded = await uploadMediaDirect(file, (progress) => {
+        setUploadItems((prev) => prev.map((i) => i.id === item.id
+          ? { ...i, progress, status: 'uploading' } : i))
+      })
+      setUploadItems((prev) => prev.map((i) => i.id === item.id
+        ? { ...i, progress: 100, status: 'done', url: uploaded.url,
+            pathname: uploaded.pathname, error: undefined } : i))
+      return uploaded
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '上传失败'
+      if (message.includes('登录已过期')) setReauthRequired(true)
+      setUploadItems((prev) => prev.map((i) => i.id === item.id
+        ? { ...i, status: 'error', error: message } : i))
+      throw error
+    }
   }
 
   const cleanupUploadedFile = async (pathname: string) => {
@@ -262,13 +216,25 @@ export default function ContentCardsManager() {
       return
     }
 
+    try {
+      const session = await fetch('/api/admin/session', {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      })
+      if (session.status === 401) {
+        setReauthRequired(true)
+        toast.error('登录已过期，请输入密码后继续保存；已选图片仍在列表中')
+        return
+      }
+      if (!session.ok) throw new Error(`HTTP ${session.status}`)
+    } catch {
+      toast.error('检查登录状态失败，请稍后重试；已选图片仍在列表中')
+      return
+    }
+
     setSaving(true)
     const region = resolveRegion()
     const successfulIds = new Set<string>()
-    // Reserve a contiguous range before concurrent uploads. The selected-file
-    // index, not completion timing, determines order across separate batches.
-    const nextDisplayOrder =
-      contentCards.reduce((max, card) => Math.max(max, card.displayOrder || 0), 0) + 1
+    const nextDisplayOrder = contentCards.reduce((max, card) => Math.max(max, card.displayOrder || 0), 0) + 1
 
     const results = await runWithConcurrency(uploadItems, 3, async (item, itemIndex) => {
       let uploaded: UploadedFile | null =
@@ -282,11 +248,7 @@ export default function ContentCardsManager() {
           region,
           displayOrder: nextDisplayOrder + itemIndex,
         })
-        setContentCards((prev) =>
-          [...prev, newCard].sort((a, b) =>
-            (a.displayOrder || Number.MAX_SAFE_INTEGER) - (b.displayOrder || Number.MAX_SAFE_INTEGER)
-          )
-        )
+        setContentCards((prev) => [...prev, newCard].sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0)))
         successfulIds.add(item.id)
         return newCard
       } catch (error) {
@@ -333,7 +295,30 @@ export default function ContentCardsManager() {
     closePanel()
   }
 
+  const handleReauth = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!reauthPassword || reauthLoading) return
+    setReauthLoading(true)
+    setReauthError('')
+    try {
+      if (!(await verifyAdminPassword(reauthPassword))) {
+        setReauthError('密码错误或验证暂时失败，请重试')
+        return
+      }
+      setReauthPassword('')
+      setReauthRequired(false)
+      await handleSaveAll()
+    } catch {
+      setReauthError('验证失败，请稍后重试')
+    } finally {
+      setReauthLoading(false)
+    }
+  }
+
   const closePanel = () => {
+    setReauthRequired(false)
+    setReauthPassword('')
+    setReauthError('')
     uploadItems.forEach((item) => URL.revokeObjectURL(item.preview))
     setPanelOpen(false)
     setUploadItems([])
@@ -388,15 +373,11 @@ export default function ContentCardsManager() {
     if (!ids || ids.length === 0) return
     if (!confirm(`确认删除「${region}」下全部 ${ids.length} 张图片？此操作不可恢复。`)) return
     setDeletingRegion(region)
-    let successCount = 0
-    for (const id of ids) {
-      try {
-        await deleteContentCard(id)
-        successCount++
-      } catch {
-        // 忽略单条失败
-      }
-    }
+    const results = await runWithConcurrency(ids, 4, async (id) => {
+      await deleteContentCard(id)
+      return id
+    })
+    const successCount = results.filter((result) => result.status === 'fulfilled').length
     setContentCards((prev) => prev.filter((c) => !ids.includes(c.id)))
     setDeletingRegion(null)
     toast.success(`已删除「${region}」下 ${successCount} 张图片`)
@@ -406,15 +387,12 @@ export default function ContentCardsManager() {
     if (selectedIds.size === 0) return
     if (!confirm(`确认删除选中的 ${selectedIds.size} 张图片？此操作不可恢复。`)) return
     setDeleting(true)
-    let successCount = 0
-    for (const id of selectedIds) {
-      try {
-        await deleteContentCard(id)
-        successCount++
-      } catch {
-        // 忽略单条失败
-      }
-    }
+    const ids = [...selectedIds]
+    const results = await runWithConcurrency(ids, 4, async (id) => {
+      await deleteContentCard(id)
+      return id
+    })
+    const successCount = results.filter((result) => result.status === 'fulfilled').length
     setContentCards((prev) => prev.filter((c) => !selectedIds.has(c.id)))
     setSelectedIds(new Set())
     setSelectMode(false)
@@ -679,6 +657,22 @@ export default function ContentCardsManager() {
                 </div>
               )}
 
+              {reauthRequired && (
+                <form onSubmit={handleReauth} className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2">
+                  <p className="text-sm text-amber-900">登录已过期。输入管理员密码后继续保存，已选图片不会丢失。</p>
+                  <div className="flex gap-2">
+                    <input type="password" aria-label="管理员密码" autoComplete="current-password"
+                      value={reauthPassword} onChange={(e) => setReauthPassword(e.target.value)}
+                      className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      placeholder="管理员密码" />
+                    <Button type="submit" disabled={reauthLoading || !reauthPassword}>
+                      {reauthLoading ? '验证中…' : '验证并继续'}
+                    </Button>
+                  </div>
+                  {reauthError && <p role="alert" className="text-sm text-red-600">{reauthError}</p>}
+                </form>
+              )}
+
               {/* 底部操作 */}
               <div className="flex justify-end gap-3 pt-2">
                 <Button variant="outline" onClick={closePanel} disabled={isUploading || saving}>
@@ -686,7 +680,7 @@ export default function ContentCardsManager() {
                 </Button>
                 <Button
                   onClick={handleSaveAll}
-                  disabled={uploadItems.length === 0 || isUploading || saving}
+                  disabled={uploadItems.length === 0 || isUploading || saving || reauthRequired}
                   className="gap-2"
                 >
                   {(isUploading || saving) && <Loader2 className="w-4 h-4 animate-spin" />}

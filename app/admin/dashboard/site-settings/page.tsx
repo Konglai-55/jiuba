@@ -8,6 +8,7 @@ import { ArrowLeft, Save, Upload, Loader2, X } from 'lucide-react'
 import Link from 'next/link'
 import { toast } from 'sonner'
 import { optimizeImageForUpload } from '@/lib/optimize-image'
+import { uploadMediaDirect } from '@/lib/direct-upload'
 
 export default function SiteSettingsPage() {
   const router = useRouter()
@@ -87,42 +88,16 @@ export default function SiteSettingsPage() {
       optimizedFile = file
     }
 
-    const data = new FormData()
-    data.append('file', optimizedFile)
-
-    const xhr = new XMLHttpRequest()
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        setUploadProgress(Math.round((e.loaded / e.total) * 100))
-      }
-    }
-
-    xhr.onload = () => {
-      try {
-        const json = JSON.parse(xhr.responseText)
-        if (xhr.status >= 200 && xhr.status < 300 && json.url) {
-          setSiteLogo(json.url)
-          toast.success('Logo 上传成功')
-        } else {
-          toast.error(json?.error || '上传失败')
-        }
-      } catch {
-        toast.error('上传响应解析失败')
-      } finally {
-        setUploading(false)
-        setUploadProgress(0)
-      }
-    }
-
-    xhr.onerror = () => {
-      toast.error('网络错误，上传失败')
+    try {
+      const uploaded = await uploadMediaDirect(optimizedFile, setUploadProgress)
+      setSiteLogo(uploaded.url)
+      toast.success('Logo 上传成功')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '上传失败')
+    } finally {
       setUploading(false)
       setUploadProgress(0)
     }
-
-    xhr.open('POST', '/api/upload')
-    xhr.send(data)
   }
 
   if (isLoading) {
