@@ -32,12 +32,15 @@ function storage(initial = []) {
     (name) => [name, class { constructor(input) { this.input = input; this.kind = name } }]))
   let idIndex = 0
   const ids = [601, 101, 501, 201, 401, 301, 701, 801, 901]
+  const files = new Map()
   let host = '98xb.net'
   const mocks = {
     'next/headers': { headers: async () => ({ get: (key) => key === 'host' ? host : null }) },
     'node:fs/promises': {
-      readFile: async () => { throw { code: 'ENOENT' } },
-      writeFile: async () => {}, rename: async () => {}, unlink: async () => {},
+      readFile: async (name) => { if (!files.has(name)) throw { code: 'ENOENT' }; return files.get(name) },
+      writeFile: async (name, value) => { files.set(name, value) },
+      rename: async (from, to) => { files.set(to, files.get(from)); files.delete(from) },
+      unlink: async () => {},
     },
     '@aws-sdk/client-s3': commands,
     'node:crypto': { ...crypto, randomBytes: (size) => {
@@ -192,6 +195,20 @@ test('content write actions require admin and reject non-boolean sync flags', as
   const result = await actions.createContentCard({ navCardId: 1, title: 'allowed', syncToOtherSite: true })
   assert.equal(result.syncToOtherSite, true)
   assert.equal(calls, 1)
+})
+
+test('API route bundle immediately sees another bundle publishing or removing a post', async () => {
+  const { data: writer, mocks, setSite } = storage()
+  const reader = load('lib/s3-data.ts', mocks)
+  assert.equal((await reader.getContentCardRecords()).length, 0)
+  const post = await writer.createContentCardRecord({ navCardId: 1, title: 'published', syncToOtherSite: true })
+  assert.equal(names(await reader.getContentCardRecords()), 'published')
+  setSite('108xb.com')
+  assert.equal(names(await reader.getContentCardRecords()), 'published')
+  await writer.deleteContentCardRecord(post.id)
+  assert.equal(names(await reader.getContentCardRecords()), '')
+  setSite('98xb.net')
+  assert.equal(names(await reader.getContentCardRecords()), 'published')
 })
 
 ;(async () => {

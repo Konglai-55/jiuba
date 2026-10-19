@@ -717,7 +717,10 @@ export async function deleteNavCardRecord(id: number) {
 
 export async function getContentCardRecords(navCardId?: number) {
   const site = await currentSite()
-  const records = await listRecords<ContentCardRecord>('content-cards')
+  // Next.js bundles API routes and server actions separately. Read the shared
+  // atomic snapshot so a write is immediately visible across both bundles/sites.
+  const records = await readPublicSnapshot<ContentCardRecord>('content-cards')
+    ?? await listRecords<ContentCardRecord>('content-cards')
   return records
     .filter((record) => visibleSites(record).includes(site))
     .filter((record) => navCardId === undefined || record.navCardId === navCardId)
@@ -752,6 +755,9 @@ export async function createContentCardRecord(data: {
 }) {
   const now = new Date().toISOString()
   const site = await currentSite()
+  if (!(await readPublicSnapshot<ContentCardRecord>('content-cards'))) {
+    await listRecords<ContentCardRecord>('content-cards')
+  }
   return createRecord<ContentCardRecord>('content-cards', {
     originSite: site,
     sites: data.syncToOtherSite === true ? [...SITE_DOMAINS] : [site],
