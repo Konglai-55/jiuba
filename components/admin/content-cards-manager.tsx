@@ -93,7 +93,7 @@ export default function ContentCardsManager() {
   const [customLabel, setCustomLabel] = useState<string>('')
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
   const [saving, setSaving] = useState(false)
-  const [syncToOtherSite, setSyncToOtherSite] = useState(false)
+  const [onlyThisSite, setOnlyThisSite] = useState(false)
   const [otherSite, setOtherSite] = useState('108xb.com')
 
   useEffect(() => {
@@ -175,7 +175,7 @@ export default function ContentCardsManager() {
     const newItems: UploadItem[] = Array.from(files).map((file) => ({
       id: `${Date.now()}-${Math.random()}`,
       file,
-      syncToOtherSite,
+      syncToOtherSite: !onlyThisSite,
       preview: URL.createObjectURL(file),
       progress: 0,
       status: 'pending',
@@ -336,7 +336,7 @@ export default function ContentCardsManager() {
     setSelectedCity('')
     setSelectedDistrict('')
     setCustomLabel('')
-    setSyncToOtherSite(false)
+    setOnlyThisSite(false)
   }
 
   const removeItem = (id: string) => {
@@ -592,15 +592,15 @@ export default function ContentCardsManager() {
 
               <div className="rounded-lg border border-border p-3 space-y-1">
                 <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
-                  <input type="checkbox" checked={syncToOtherSite} disabled={saving}
+                  <input type="checkbox" checked={onlyThisSite} disabled={saving}
                     onChange={(event) => {
                       const checked = event.target.checked
-                      setSyncToOtherSite(checked)
-                      setUploadItems((items) => items.map((item) => ({ ...item, syncToOtherSite: checked })))
+                      setOnlyThisSite(checked)
+                      setUploadItems((items) => items.map((item) => ({ ...item, syncToOtherSite: !checked })))
                     }} className="h-4 w-4 accent-primary" />
-                  同步到 {otherSite}
+                  本批全部仅本站展示
                 </label>
-                <p className="text-xs text-muted-foreground">不勾选仅在本站展示。可整批选择，也可在每张图片下单独调整。</p>
+                <p className="text-xs text-muted-foreground">默认全部同步到 {otherSite}。个别图片不同步时，只需勾选图片下的“仅本站”。</p>
               </div>
 
               {/* 拖拽/点击上传区域 */}
@@ -669,11 +669,11 @@ export default function ContentCardsManager() {
                         </div>
                       )}
                       <label className="absolute top-full left-0 right-0 flex items-center gap-1 py-1 text-xs cursor-pointer">
-                        <input type="checkbox" checked={item.syncToOtherSite} disabled={saving}
-                          aria-label={`同步 ${item.file.name} 到 ${otherSite}`}
+                        <input type="checkbox" checked={!item.syncToOtherSite} disabled={saving}
+                          aria-label={`${item.file.name} 仅本站展示`}
                           onChange={(event) => setUploadItems((items) => items.map((value) =>
-                            value.id === item.id ? { ...value, syncToOtherSite: event.target.checked } : value))} />
-                        两站展示
+                            value.id === item.id ? { ...value, syncToOtherSite: !event.target.checked } : value))} />
+                        仅本站
                       </label>
                       {/* 删除按钮 */}
                       {item.status !== 'uploading' && !saving && (
