@@ -3,6 +3,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
 const crypto = require('node:crypto')
+const { AsyncLocalStorage } = require('node:async_hooks')
 const ts = require('typescript')
 
 const root = path.resolve(process.argv[2] || path.join(__dirname, '..'))
@@ -22,7 +23,7 @@ function load(relative, mocks, globals = {}, cache = new Map()) {
     return require(id)
   }
   vm.runInNewContext(code, { module, exports: module.exports, require: localRequire,
-    console, process, Buffer, AbortSignal, setTimeout, clearTimeout, ...globals }, { filename })
+    console, process, Buffer, URL, AbortSignal, setTimeout, clearTimeout, ...globals }, { filename })
   return module.exports
 }
 
@@ -34,13 +35,20 @@ function storage(initial = []) {
   const ids = [601, 101, 501, 201, 401, 301, 701, 801, 901]
   const files = new Map()
   let host = '98xb.net'
+  const context = new AsyncLocalStorage()
   const mocks = {
-    'next/headers': { headers: async () => ({ get: (key) => key === 'host' ? host : null }) },
+    'next/headers': { headers: async () => ({ get: (key) => key === 'host' ? (context.getStore() || host) : null }) },
     'node:fs/promises': {
       readFile: async (name) => { if (!files.has(name)) throw { code: 'ENOENT' }; return files.get(name) },
       writeFile: async (name, value) => { files.set(name, value) },
       rename: async (from, to) => { files.set(to, files.get(from)); files.delete(from) },
-      unlink: async () => {},
+      unlink: async (name) => { if (!files.delete(name)) throw { code: 'ENOENT' } },
+      mkdir: async () => {},
+      open: async (name) => {
+        if (files.has(name)) throw { code: 'EEXIST' }
+        files.set(name, '')
+        return { writeFile: async (value) => { files.set(name, value) }, close: async () => {} }
+      },
     },
     '@aws-sdk/client-s3': commands,
     'node:crypto': { ...crypto, randomBytes: (size) => {
@@ -67,7 +75,7 @@ function storage(initial = []) {
       },
     }) },
   }
-  return { mocks, objects, setSite: (value) => { host = value }, data: load('lib/s3-data.ts', mocks) }
+  return { mocks, objects, atSite: (site, run) => context.run(site, run), setSite: (value) => { host = value }, data: load('lib/s3-data.ts', mocks) }
 }
 
 const labels = ['天河1', '天河2', '天河3', '海珠1', '海珠2', '海珠3']
@@ -209,6 +217,30 @@ test('API route bundle immediately sees another bundle publishing or removing a 
   assert.equal(names(await reader.getContentCardRecords()), '')
   setSite('98xb.net')
   assert.equal(names(await reader.getContentCardRecords()), 'published')
+})
+
+test('two process bundles can publish concurrently without dropping a snapshot row', async () => {
+  const { data, mocks, atSite } = storage()
+  const peer = load('lib/s3-data.ts', mocks)
+  await Promise.all([
+    atSite('98xb.net', () => data.createContentCardRecord({ navCardId: 1, title: 'left', syncToOtherSite: true })),
+    atSite('108xb.com', () => peer.createContentCardRecord({ navCardId: 1, title: 'right', syncToOtherSite: true })),
+  ])
+  assert.equal((await data.getContentCardRecords()).length, 2)
+  assert.equal((await peer.getContentCardRecords()).length, 2)
+})
+
+test('simultaneous deletes on both sites do not resurrect a shared post', async () => {
+  const { data, mocks, atSite, objects } = storage()
+  const peer = load('lib/s3-data.ts', mocks)
+  const post = await data.createContentCardRecord({ navCardId: 1, title: 'shared', syncToOtherSite: true })
+  await Promise.all([
+    atSite('98xb.net', () => data.deleteContentCardRecord(post.id)),
+    atSite('108xb.com', () => peer.deleteContentCardRecord(post.id)),
+  ])
+  assert.equal((await data.getContentCardRecords()).length, 0)
+  assert.equal((await peer.getContentCardRecords()).length, 0)
+  assert.ok(!objects.has(prefix + 'content-cards/' + post.id + '.json'))
 })
 
 ;(async () => {

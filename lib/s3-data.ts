@@ -1,5 +1,6 @@
 import { currentSite, SITE_DOMAINS, visibleSites, type SiteDomain } from '@/lib/site'
-import { unlink, readFile, writeFile, rename } from 'node:fs/promises'
+import { unlink, readFile, writeFile, rename, mkdir, open } from 'node:fs/promises'
+import { setTimeout as delay } from 'node:timers/promises'
 import { localMediaPath } from '@/lib/local-media'
 import {
   DeleteObjectCommand,
@@ -171,7 +172,7 @@ async function readPublicSnapshot<T>(collection: Collection): Promise<T[] | null
   }
 }
 
-async function writePublicSnapshot<T>(collection: Collection, records: T[]): Promise<void> {
+async function writePublicSnapshotFile<T>(collection: Collection, records: T[]): Promise<void> {
   if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return
   const target = PUBLIC_SNAPSHOT_DIR + '/' + collection + '.json'
   const temporary = target + '.' + randomUUID() + '.tmp'
@@ -181,6 +182,49 @@ async function writePublicSnapshot<T>(collection: Collection, records: T[]): Pro
   } catch (error) {
     console.error('Failed to update public data snapshot:', collection, error)
   }
+}
+
+// Both managed projects use the same data directory. Atomic lock files serialize
+// snapshot merges and edits of the same post across processes and Next.js bundles.
+async function withDataLock<T>(name: string, run: () => Promise<T>): Promise<T> {
+  if (!/^[a-z0-9-]{1,80}$/.test(name)) throw new Error('内容标识无效')
+  await mkdir(PUBLIC_SNAPSHOT_DIR, { recursive: true })
+  const lock = `${PUBLIC_SNAPSHOT_DIR}/${name}.lock`
+  const deadline = Date.now() + 30_000
+  while (true) {
+    try {
+      const handle = await open(lock, 'wx', 0o600)
+      try {
+        await handle.writeFile(String(process.pid))
+        return await run()
+      } finally {
+        await handle.close()
+        await unlink(lock)
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      try {
+        const owner = Number(await readFile(lock, 'utf8'))
+        if (Number.isSafeInteger(owner) && owner > 0) {
+          try { process.kill(owner, 0) } catch (probe) {
+            if ((probe as NodeJS.ErrnoException).code === 'ESRCH') await unlink(lock)
+          }
+        }
+      } catch {}
+      if (Date.now() >= deadline) throw new Error('内容正在更新，请稍后重试')
+      await delay(25)
+    }
+  }
+}
+
+async function writePublicSnapshot<T>(collection: Collection, records: T[]) {
+  if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return
+  await withDataLock(`snapshot-${collection}`, async () => {
+    // Content snapshots are merged by every write; a stale S3 listing must never
+    // overwrite newer posts published by the other process.
+    if (collection === 'content-cards' && await readPublicSnapshot(collection)) return
+    await writePublicSnapshotFile(collection, records)
+  })
 }
 
 const CACHEABLE_COLLECTIONS = new Set<Collection>([
@@ -212,14 +256,14 @@ const snapshotMutations = new Map<Collection, Promise<void>>()
 async function mutatePublicSnapshot<T>(collection: Collection, mutate: (records: T[]) => T[]) {
   if (!PUBLIC_SNAPSHOT_COLLECTIONS.has(collection)) return
   const previous = snapshotMutations.get(collection) || Promise.resolve()
-  const next = previous.then(async () => {
+  const next = previous.then(() => withDataLock(`snapshot-${collection}`, async () => {
     let records: T[] = []
     try {
       const value = JSON.parse(await readFile(PUBLIC_SNAPSHOT_DIR + '/' + collection + '.json', 'utf8'))
       if (Array.isArray(value)) records = value as T[]
     } catch {}
-    await writePublicSnapshot(collection, mutate(records))
-  })
+    await writePublicSnapshotFile(collection, mutate(records))
+  }))
   snapshotMutations.set(collection, next.catch(() => undefined))
   await next
 }
@@ -446,7 +490,8 @@ function storedMediaKey(url: string | null | undefined) {
 }
 
 export async function deleteUploadedMedia(pathname: string) {
-  const cards = await listRecords<ContentCardRecord>('content-cards')
+  const cards = await readPublicSnapshot<ContentCardRecord>('content-cards')
+    ?? await listRecords<ContentCardRecord>('content-cards')
   if (cards.some((card) => [card.imageUrl, card.videoUrl].some((url) => storedMediaKey(url) === pathname))) return
   if (!pathname.startsWith('media/')) {
     throw new Error('Only media objects can be deleted through the upload API')
@@ -784,49 +829,53 @@ export async function updateContentCardRecord(
     >
   >
 ) {
-  const current = await readJson<ContentCardRecord>(objectKey('content-cards', id))
-  if (!current || !visibleSites(current).includes(await currentSite())) return null
-  const updated = await updateRecord<ContentCardRecord>('content-cards', id, {
-    ...data,
-    updatedAt: new Date().toISOString(),
+  return withDataLock(`post-${id}`, async () => {
+    const current = await readJson<ContentCardRecord>(objectKey('content-cards', id))
+    if (!current || !visibleSites(current).includes(await currentSite())) return null
+    const updated = await updateRecord<ContentCardRecord>('content-cards', id, {
+      ...data,
+      updatedAt: new Date().toISOString(),
+    })
+    if (updated) {
+      await deleteKeys([
+        data.imageUrl !== undefined && data.imageUrl !== current?.imageUrl
+          ? storedMediaKey(current?.imageUrl)
+          : null,
+        data.videoUrl !== undefined && data.videoUrl !== current?.videoUrl
+          ? storedMediaKey(current?.videoUrl)
+          : null,
+      ])
+    }
+    return updated
   })
-  if (updated) {
-    await deleteKeys([
-      data.imageUrl !== undefined && data.imageUrl !== current?.imageUrl
-        ? storedMediaKey(current?.imageUrl)
-        : null,
-      data.videoUrl !== undefined && data.videoUrl !== current?.videoUrl
-        ? storedMediaKey(current?.videoUrl)
-        : null,
-    ])
-  }
-  return updated
 }
 
 export async function deleteContentCardRecord(id: number) {
-  const card = await readJson<ContentCardRecord>(objectKey('content-cards', id))
-  const site = await currentSite()
-  if (!card || !visibleSites(card).includes(site)) return
-  const remainingSites = visibleSites(card).filter((domain) => domain !== site)
-  if (remainingSites.length > 0) {
-    await updateRecord<ContentCardRecord>('content-cards', id, { sites: remainingSites, updatedAt: new Date().toISOString() })
-    return
-  }
+  return withDataLock(`post-${id}`, async () => {
+    const card = await readJson<ContentCardRecord>(objectKey('content-cards', id))
+    const site = await currentSite()
+    if (!card || !visibleSites(card).includes(site)) return
+    const remainingSites = visibleSites(card).filter((domain) => domain !== site)
+    if (remainingSites.length > 0) {
+      await updateRecord<ContentCardRecord>('content-cards', id, { sites: remainingSites, updatedAt: new Date().toISOString() })
+      return
+    }
 
-  // Remove the visible record first. Download history and media cleanup are
-  // deferred so a slow object-store listing cannot make the delete appear stuck.
-  await deleteKey(objectKey('content-cards', id))
-  // Media cleanup is independent of the metadata delete. Do not scan download
-  // history here: that collection can be large and a slow listing must never
-  // block or delay the user-visible delete.
-  void deleteKeys([
-    storedMediaKey(card.imageUrl),
-    storedMediaKey(card.videoUrl),
-  ]).catch((error) => {
-    console.error('Deferred content-card media cleanup failed:', error instanceof Error ? error.name : 'unknown')
+    // Remove the visible record first. Download history and media cleanup are
+    // deferred so a slow object-store listing cannot make the delete appear stuck.
+    await deleteKey(objectKey('content-cards', id))
+    // Media cleanup is independent of the metadata delete. Do not scan download
+    // history here: that collection can be large and a slow listing must never
+    // block or delay the user-visible delete.
+    void deleteKeys([
+      storedMediaKey(card.imageUrl),
+      storedMediaKey(card.videoUrl),
+    ]).catch((error) => {
+      console.error('Deferred content-card media cleanup failed:', error instanceof Error ? error.name : 'unknown')
+    })
+
+    // Click events are intentionally retained for historical daily totals.
   })
-
-  // Click events are intentionally retained for historical daily totals.
 }
 
 export async function getRegionRecords(options: { navCardId?: number; includeDisabled?: boolean } = {}) {
