@@ -1,3 +1,4 @@
+import { currentSite, SITE_DOMAINS, visibleSites, type SiteDomain } from '@/lib/site'
 import { unlink, readFile, writeFile, rename } from 'node:fs/promises'
 import { localMediaPath } from '@/lib/local-media'
 import {
@@ -38,6 +39,8 @@ export interface NavCardRecord {
 }
 
 export interface ContentCardRecord {
+  sites?: SiteDomain[]
+  originSite?: SiteDomain
   id: number
   navCardId: number
   title: string
@@ -443,6 +446,8 @@ function storedMediaKey(url: string | null | undefined) {
 }
 
 export async function deleteUploadedMedia(pathname: string) {
+  const cards = await listRecords<ContentCardRecord>('content-cards')
+  if (cards.some((card) => [card.imageUrl, card.videoUrl].some((url) => storedMediaKey(url) === pathname))) return
   if (!pathname.startsWith('media/')) {
     throw new Error('Only media objects can be deleted through the upload API')
   }
@@ -684,7 +689,7 @@ export async function updateNavCardRecord(
 export async function deleteNavCardRecord(id: number) {
   const [navCard, contentCards, regions, downloads] = await Promise.all([
     readJson<NavCardRecord>(objectKey('nav-cards', id)),
-    getContentCardRecords(id),
+    listRecords<ContentCardRecord>('content-cards').then((items) => items.filter((item) => item.navCardId === id)),
     listRecords<RegionRecord>('regions'),
     listRecords<DownloadRecord>('download-records'),
   ])
@@ -711,8 +716,10 @@ export async function deleteNavCardRecord(id: number) {
 }
 
 export async function getContentCardRecords(navCardId?: number) {
+  const site = await currentSite()
   const records = await listRecords<ContentCardRecord>('content-cards')
   return records
+    .filter((record) => visibleSites(record).includes(site))
     .filter((record) => navCardId === undefined || record.navCardId === navCardId)
     .sort(compareContentCardOrder)
 }
@@ -732,6 +739,7 @@ function compareContentCardOrder(a: ContentCardRecord, b: ContentCardRecord) {
 
 
 export async function createContentCardRecord(data: {
+  syncToOtherSite?: boolean
   navCardId: number
   title: string
   description?: string
@@ -743,7 +751,10 @@ export async function createContentCardRecord(data: {
   displayOrder?: number
 }) {
   const now = new Date().toISOString()
+  const site = await currentSite()
   return createRecord<ContentCardRecord>('content-cards', {
+    originSite: site,
+    sites: data.syncToOtherSite === true ? [...SITE_DOMAINS] : [site],
     navCardId: data.navCardId,
     title: data.title,
     description: data.description || null,
@@ -768,6 +779,7 @@ export async function updateContentCardRecord(
   >
 ) {
   const current = await readJson<ContentCardRecord>(objectKey('content-cards', id))
+  if (!current || !visibleSites(current).includes(await currentSite())) return null
   const updated = await updateRecord<ContentCardRecord>('content-cards', id, {
     ...data,
     updatedAt: new Date().toISOString(),
@@ -787,7 +799,13 @@ export async function updateContentCardRecord(
 
 export async function deleteContentCardRecord(id: number) {
   const card = await readJson<ContentCardRecord>(objectKey('content-cards', id))
-  if (!card) return
+  const site = await currentSite()
+  if (!card || !visibleSites(card).includes(site)) return
+  const remainingSites = visibleSites(card).filter((domain) => domain !== site)
+  if (remainingSites.length > 0) {
+    await updateRecord<ContentCardRecord>('content-cards', id, { sites: remainingSites, updatedAt: new Date().toISOString() })
+    return
+  }
 
   // Remove the visible record first. Download history and media cleanup are
   // deferred so a slow object-store listing cannot make the delete appear stuck.

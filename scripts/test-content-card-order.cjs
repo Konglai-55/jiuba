@@ -14,7 +14,7 @@ function load(relative, mocks, globals = {}, cache = new Map()) {
   const module = { exports: {} }
   cache.set(filename, module)
   const code = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2020 },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, esModuleInterop: true, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2020 },
   }).outputText
   const localRequire = (id) => {
     if (Object.hasOwn(mocks, id)) return mocks[id]
@@ -32,7 +32,9 @@ function storage(initial = []) {
     (name) => [name, class { constructor(input) { this.input = input; this.kind = name } }]))
   let idIndex = 0
   const ids = [601, 101, 501, 201, 401, 301, 701, 801, 901]
+  let host = '98xb.net'
   const mocks = {
+    'next/headers': { headers: async () => ({ get: (key) => key === 'host' ? host : null }) },
     'node:fs/promises': {
       readFile: async () => { throw { code: 'ENOENT' } },
       writeFile: async () => {}, rename: async () => {}, unlink: async () => {},
@@ -62,7 +64,7 @@ function storage(initial = []) {
       },
     }) },
   }
-  return { mocks, data: load('lib/s3-data.ts', mocks) }
+  return { mocks, objects, setSite: (value) => { host = value }, data: load('lib/s3-data.ts', mocks) }
 }
 
 const labels = ['天河1', '天河2', '天河3', '海珠1', '海珠2', '海珠3']
@@ -120,6 +122,76 @@ test('new batches append after legacy uploads and keep selected order despite co
     navCardId: 1, title: `第二批${index + 1}`, displayOrder: index + 4,
   })
   assert.equal(names(await data.getContentCardRecords(1)), '旧图1,旧图2,新图1,新图2,新图3,第二批1,第二批2')
+})
+
+
+test('both hosts and www aliases resolve correctly', async () => {
+  const { siteFromHost } = load('lib/site-host.ts', {})
+  assert.equal(siteFromHost('108xb.com'), '108xb.com')
+  assert.equal(siteFromHost('www.108xb.com:3000'), '108xb.com')
+  assert.equal(siteFromHost('98XB.NET'), '98xb.net')
+})
+
+test('unchecked stays on origin, checked appears on both, in either direction', async () => {
+  const { data, setSite } = storage()
+  const local98 = await data.createContentCardRecord({ navCardId: 1, title: '98 only', displayOrder: 1 })
+  const shared98 = await data.createContentCardRecord({ navCardId: 1, title: '98 shared', syncToOtherSite: true, displayOrder: 2 })
+  assert.equal(names(await data.getContentCardRecords(1)), '98 only,98 shared')
+  setSite('108xb.com')
+  assert.equal(names(await data.getContentCardRecords(1)), '98 shared')
+  await data.createContentCardRecord({ navCardId: 1, title: '108 only', displayOrder: 3 })
+  await data.createContentCardRecord({ navCardId: 1, title: '108 shared', syncToOtherSite: true, displayOrder: 4 })
+  assert.equal(names(await data.getContentCardRecords(1)), '98 shared,108 only,108 shared')
+  assert.equal(await data.updateContentCardRecord(local98.id, { title: 'bad update' }), null)
+  await data.deleteContentCardRecord(local98.id)
+  setSite('98xb.net')
+  assert.equal(names(await data.getContentCardRecords(1)), '98 only,98 shared,108 shared')
+  assert.equal(shared98.sites.length, 2)
+})
+
+test('deleting shared post removes this site only and retains the other media reference', async () => {
+  const { data, setSite, objects } = storage()
+  const mediaKey = 'media/1700000000000-11111111-1111-1111-1111-111111111111.jpg'
+  objects.set(mediaKey, 'image fixture')
+  const shared = await data.createContentCardRecord({ navCardId: 1, title: 'shared', imageUrl: '/api/file?pathname=' + mediaKey, syncToOtherSite: true })
+  await data.deleteContentCardRecord(shared.id)
+  assert.equal((await data.getContentCardRecords()).length, 0)
+  setSite('108xb.com')
+  assert.equal(names(await data.getContentCardRecords()), 'shared')
+  assert.ok(objects.has(mediaKey))
+  await data.deleteUploadedMedia(mediaKey)
+  assert.ok(objects.has(mediaKey), 'upload cleanup must not remove a published file')
+  await data.deleteContentCardRecord(shared.id)
+  assert.equal((await data.getContentCardRecords()).length, 0)
+  assert.ok(!objects.has(prefix + 'content-cards/' + shared.id + '.json'))
+})
+
+test('legacy posts stay visible on both; removing one site preserves legacy peer', async () => {
+  const { data, setSite } = storage([card(4000, 'existing', 0)])
+  assert.equal(names(await data.getContentCardRecords()), 'existing')
+  setSite('108xb.com')
+  assert.equal(names(await data.getContentCardRecords()), 'existing')
+  await data.deleteContentCardRecord(4000)
+  assert.equal(names(await data.getContentCardRecords()), '')
+  setSite('98xb.net')
+  assert.equal(names(await data.getContentCardRecords()), 'existing')
+})
+
+test('content write actions require admin and reject non-boolean sync flags', async () => {
+  let authorized = false
+  let calls = 0
+  const actions = load('app/actions/content-cards.ts', {
+    '@/lib/admin-session': { hasAdminSession: async () => authorized },
+    '@/lib/s3-data': { createContentCardRecord: async (value) => { calls++; return value }, deleteContentCardRecord: async () => { calls++ } },
+  })
+  await assert.rejects(actions.createContentCard({ navCardId: 1, title: 'blocked' }), /登录已过期/)
+  await assert.rejects(actions.deleteContentCard(1), /登录已过期/)
+  assert.equal(calls, 0)
+  authorized = true
+  await assert.rejects(actions.createContentCard({ navCardId: 1, title: 'invalid', syncToOtherSite: 'false' }), /同步选项无效/)
+  const result = await actions.createContentCard({ navCardId: 1, title: 'allowed', syncToOtherSite: true })
+  assert.equal(result.syncToOtherSite, true)
+  assert.equal(calls, 1)
 })
 
 ;(async () => {

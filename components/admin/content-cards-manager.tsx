@@ -10,6 +10,7 @@ import { optimizeImageForUpload } from '@/lib/optimize-image'
 import { uploadMediaDirect } from '@/lib/direct-upload'
 import { getNavCards } from '@/app/actions/nav-cards'
 import { toast } from 'sonner'
+import { siteFromHost } from '@/lib/site-host'
 interface Region {
   id: number
   cityName: string
@@ -33,9 +34,11 @@ interface ContentCard {
   address: string | null
   region: string | null
   displayOrder: number
+  sites?: string[]
 }
 
 interface UploadItem {
+  syncToOtherSite: boolean
   id: string
   file: File
   preview: string
@@ -90,6 +93,12 @@ export default function ContentCardsManager() {
   const [customLabel, setCustomLabel] = useState<string>('')
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
   const [saving, setSaving] = useState(false)
+  const [syncToOtherSite, setSyncToOtherSite] = useState(false)
+  const [otherSite, setOtherSite] = useState('108xb.com')
+
+  useEffect(() => {
+    setOtherSite(siteFromHost(window.location.host) === '98xb.net' ? '108xb.com' : '98xb.net')
+  }, [])
   const [reauthRequired, setReauthRequired] = useState(false)
   const [reauthPassword, setReauthPassword] = useState('')
   const [reauthError, setReauthError] = useState('')
@@ -166,6 +175,7 @@ export default function ContentCardsManager() {
     const newItems: UploadItem[] = Array.from(files).map((file) => ({
       id: `${Date.now()}-${Math.random()}`,
       file,
+      syncToOtherSite,
       preview: URL.createObjectURL(file),
       progress: 0,
       status: 'pending',
@@ -246,6 +256,7 @@ export default function ContentCardsManager() {
           title: item.file.name,
           imageUrl: uploaded.url,
           region,
+          syncToOtherSite: item.syncToOtherSite,
           displayOrder: nextDisplayOrder + itemIndex,
         })
         setContentCards((prev) => [...prev, newCard].sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0)))
@@ -325,6 +336,7 @@ export default function ContentCardsManager() {
     setSelectedCity('')
     setSelectedDistrict('')
     setCustomLabel('')
+    setSyncToOtherSite(false)
   }
 
   const removeItem = (id: string) => {
@@ -528,7 +540,7 @@ export default function ContentCardsManager() {
             <div className="mb-6 border border-border rounded-xl p-5 bg-card space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="font-semibold text-foreground">批量上传图片</h3>
-                <button onClick={closePanel} className="text-muted-foreground hover:text-foreground">
+                <button onClick={closePanel} disabled={saving} className="text-muted-foreground hover:text-foreground">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -578,6 +590,19 @@ export default function ContentCardsManager() {
                 </p>
               )}
 
+              <div className="rounded-lg border border-border p-3 space-y-1">
+                <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
+                  <input type="checkbox" checked={syncToOtherSite} disabled={saving}
+                    onChange={(event) => {
+                      const checked = event.target.checked
+                      setSyncToOtherSite(checked)
+                      setUploadItems((items) => items.map((item) => ({ ...item, syncToOtherSite: checked })))
+                    }} className="h-4 w-4 accent-primary" />
+                  同步到 {otherSite}
+                </label>
+                <p className="text-xs text-muted-foreground">不勾选仅在本站展示。可整批选择，也可在每张图片下单独调整。</p>
+              </div>
+
               {/* 拖拽/点击上传区域 */}
               <div
                 className="border-2 border-dashed border-border rounded-xl p-8 text-center cursor-pointer hover:border-primary hover:bg-primary/5 transition-colors"
@@ -603,7 +628,7 @@ export default function ContentCardsManager() {
 
               {/* 待上传预览列表 */}
               {uploadItems.length > 0 && (
-                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-3">
+                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-x-3 gap-y-10 pb-7">
                   {uploadItems.map((item) => (
                     <div key={item.id} className="relative group aspect-square">
                       <img
@@ -643,8 +668,15 @@ export default function ContentCardsManager() {
                           </span>
                         </div>
                       )}
+                      <label className="absolute top-full left-0 right-0 flex items-center gap-1 py-1 text-xs cursor-pointer">
+                        <input type="checkbox" checked={item.syncToOtherSite} disabled={saving}
+                          aria-label={`同步 ${item.file.name} 到 ${otherSite}`}
+                          onChange={(event) => setUploadItems((items) => items.map((value) =>
+                            value.id === item.id ? { ...value, syncToOtherSite: event.target.checked } : value))} />
+                        两站展示
+                      </label>
                       {/* 删除按钮 */}
-                      {item.status !== 'uploading' && (
+                      {item.status !== 'uploading' && !saving && (
                         <button
                           onClick={() => removeItem(item.id)}
                           className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-red-500 text-white hidden group-hover:flex items-center justify-center shadow"
@@ -731,6 +763,9 @@ export default function ContentCardsManager() {
                         <p className="text-white text-xs truncate">{card.region}</p>
                       </div>
                     )}
+                    <span className="absolute top-1.5 left-1.5 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white pointer-events-none">
+                      {!card.sites || card.sites.length === 2 ? '两站展示' : '仅本站'}
+                    </span>
                     {/* 批量选择模式：勾选图标 */}
                     {selectMode && (
                       <div className={`absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center shadow ${
